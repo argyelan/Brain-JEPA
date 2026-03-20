@@ -474,6 +474,24 @@ def process_run(run_name, run_dir, seg_img, schaefer_vol_atlas,
     out_run_dir = os.path.join(output_subj_dir, run_name)
     os.makedirs(out_run_dir, exist_ok=True)
 
+    # ── Save denoised volumetric BOLD ─────────────────────────────────────────
+    from nilearn.image import clean_img, index_img
+    keep_idx = np.where(sample_mask)[0]
+    bold_scrubbed = index_img(bold_img, keep_idx)
+    confounds_scrubbed = confounds[keep_idx, :]
+    clean_vol = clean_img(
+        bold_scrubbed,
+        confounds=confounds_scrubbed,
+        detrend=True,
+        standardize=False,
+        high_pass=HIGH_PASS,
+        low_pass=LOW_PASS,
+        t_r=tr,
+    )
+    clean_vol_path = os.path.join(out_run_dir, f"{run_name}_denoised.nii.gz")
+    nib.save(clean_vol, clean_vol_path)
+    print(f"    [VOL] Saved denoised volumetric → {os.path.basename(clean_vol_path)}")
+
     # ── CIFTI track (primary if available + dlabel provided) ──────────────────
     if use_cifti:
         print(f"    [CIFTI] Loading {os.path.basename(cifti_file)}...")
