@@ -270,7 +270,17 @@ def load_cifti(cifti_file):
 def save_cifti(clean_data, template_img, out_path):
     """Save cleaned [T, G] data as a new dtseries.nii using template header."""
     import nibabel as nib
-    new_img = nib.Cifti2Image(clean_data, header=template_img.header,
+    # Rebuild the time axis to match the (possibly scrubbed) T dimension
+    old_time_ax = template_img.header.get_axis(0)
+    new_time_ax = nib.cifti2.SeriesAxis(
+        start=old_time_ax.start,
+        step=old_time_ax.step,
+        size=clean_data.shape[0],
+        unit=old_time_ax.unit,
+    )
+    bm_ax = template_img.header.get_axis(1)
+    new_header = nib.Cifti2Header.from_axes((new_time_ax, bm_ax))
+    new_img = nib.Cifti2Image(clean_data, header=new_header,
                               nifti_header=template_img.nifti_header)
     nib.save(new_img, out_path)
 
@@ -292,12 +302,34 @@ def parcellate_cifti(clean_data, bm_ax, schaefer_dlabel_img, tian_img):
     T = clean_data.shape[0]
 
     # ── Cortical: Schaefer dlabel ─────────────────────────────────────────────
-    dlabel_data  = schaefer_dlabel_img.get_fdata(dtype=np.float32)  # [1, G]
-    parcel_ids   = dlabel_data[0, :]   # [G] values 0–400; 0 = medial wall
+    # dlabel covers all surface vertices (including medial wall, label=0),
+    # while the dtseries only contains non-medial-wall cortical grayordinates.
+    # We must look up each grayordinate's vertex index via the brain model axis.
+    dlabel_data = schaefer_dlabel_img.get_fdata(dtype=np.float32)  # [1, G_dlabel]
+    parcel_ids  = dlabel_data[0, :]   # [G_dlabel]; values 0–400, 0 = medial wall
+
+    dlabel_bm_ax = schaefer_dlabel_img.header.get_axis(1)
+
+    # Build vertex→parcel maps (left and right hemisphere separately)
+    left_parcel  = np.zeros(64984, dtype=np.float32)   # generous upper bound
+    right_parcel = np.zeros(64984, dtype=np.float32)
+    for name, slc, model in dlabel_bm_ax.iter_structures():
+        if 'LEFT'  in name:
+            left_parcel[model.vertex]  = parcel_ids[slc]
+        elif 'RIGHT' in name:
+            right_parcel[model.vertex] = parcel_ids[slc]
+
+    # Map each cortical grayordinate in the dtseries to its Schaefer parcel
+    grayord_parcel = np.zeros(clean_data.shape[1], dtype=np.float32)
+    for name, slc, model in bm_ax.iter_structures():
+        if 'CORTEX_LEFT'  in name:
+            grayord_parcel[slc] = left_parcel[model.vertex]
+        elif 'CORTEX_RIGHT' in name:
+            grayord_parcel[slc] = right_parcel[model.vertex]
 
     ts_cortical = np.zeros((SCHAEFER_N_ROIS, T), dtype=np.float32)
     for p in range(1, SCHAEFER_N_ROIS + 1):
-        mask = parcel_ids == p
+        mask = grayord_parcel == p
         if mask.sum() > 0:
             ts_cortical[p - 1, :] = clean_data[:, mask].mean(axis=1)
 
