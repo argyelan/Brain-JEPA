@@ -165,10 +165,10 @@ def load_motion_regressors(motion_file):
 
 
 def compute_fd(motion_df, head_radius=HEAD_RADIUS):
-    """Framewise displacement. Rotations (rad) → mm via head_radius."""
+    """Framewise displacement. HCP rotations are in degrees → convert to radians → mm."""
     params = motion_df[["trans_x", "trans_y", "trans_z",
                          "rot_x", "rot_y", "rot_z"]].copy()
-    params[["rot_x", "rot_y", "rot_z"]] *= head_radius
+    params[["rot_x", "rot_y", "rot_z"]] *= (np.pi / 180) * head_radius  # degrees → mm
     diff = params.diff().abs()
     diff.iloc[0] = 0
     return diff.sum(axis=1).values
