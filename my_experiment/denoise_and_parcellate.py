@@ -96,6 +96,8 @@ def parse_args():
     p.add_argument("--fd_threshold", type=float, default=FD_THRESHOLD)
     p.add_argument("--n_compcor", type=int, default=N_COMPCOR)
     p.add_argument("--min_volumes", type=int, default=MIN_VOLUMES)
+    p.add_argument("--debug", action="store_true",
+                   help="Save WM/CSF masks as NIfTI for visual QC")
     return p.parse_args()
 
 
@@ -460,6 +462,16 @@ def process_run(run_name, run_dir, seg_img, schaefer_vol_atlas,
     print(f"    Computing aCompCor...")
     wm_mask  = make_tissue_mask(seg_img, WM_LABELS,  bold_img)
     csf_mask = make_tissue_mask(seg_img, CSF_LABELS, bold_img)
+
+    if args.debug:
+        _dbg_dir = os.path.join(output_subj_dir, run_name)
+        os.makedirs(_dbg_dir, exist_ok=True)
+        nib.save(wm_mask,  os.path.join(_dbg_dir, f"{run_name}_wm_mask.nii.gz"))
+        nib.save(csf_mask, os.path.join(_dbg_dir, f"{run_name}_csf_mask.nii.gz"))
+        print(f"    [DEBUG] WM voxels : {int(wm_mask.get_fdata().sum())}")
+        print(f"    [DEBUG] CSF voxels: {int(csf_mask.get_fdata().sum())}")
+        print(f"    [DEBUG] Masks saved to {_dbg_dir}")
+
     acompcor = compute_acompcor(bold_img, wm_mask, csf_mask, args.n_compcor)
 
     motion_24 = friston_24(motion_df)
@@ -473,6 +485,55 @@ def process_run(run_name, run_dir, seg_img, schaefer_vol_atlas,
     # ── Output directory ──────────────────────────────────────────────────────
     out_run_dir = os.path.join(output_subj_dir, run_name)
     os.makedirs(out_run_dir, exist_ok=True)
+
+    if args.debug:
+        # Save full confounds matrix (before scrubbing) as TSV
+        motion_cols = [f"motion_{i}" for i in range(motion_24.shape[1])]
+        acompcor_cols = ([f"aCompCor_{i}" for i in range(acompcor.shape[1])]
+                         if acompcor is not None else [])
+        col_names = motion_cols + acompcor_cols
+        confounds_df = pd.DataFrame(confounds, columns=col_names)
+        confounds_df.insert(0, "volume", np.arange(len(confounds_df)))
+        confounds_df.insert(1, "censored", (~sample_mask[:len(confounds_df)]).astype(int))
+        confounds_path = os.path.join(out_run_dir, f"{run_name}_confounds.tsv")
+        confounds_df.to_csv(confounds_path, sep="\t", index=False)
+        print(f"    [DEBUG] Confounds saved → {os.path.basename(confounds_path)}")
+
+        # Save R² map: variance explained by confounds at each voxel
+        from nilearn.maskers import NiftiMasker
+        brain_masker = NiftiMasker(mask_strategy="whole-brain-template", standardize=False)
+        bold_2d = brain_masker.fit_transform(bold_img)  # [T, voxels]
+        T_c = min(bold_2d.shape[0], confounds.shape[0])
+        bold_2d = bold_2d[:T_c]
+        conf_c  = confounds[:T_c]
+        X = np.column_stack([conf_c, np.ones(T_c)])
+        beta = np.linalg.lstsq(X, bold_2d, rcond=None)[0]
+        fitted = X @ beta
+        ss_res = ((bold_2d - fitted) ** 2).sum(axis=0)
+        ss_tot = ((bold_2d - bold_2d.mean(axis=0)) ** 2).sum(axis=0)
+        r2 = np.where(ss_tot > 0, 1 - ss_res / ss_tot, 0).astype(np.float32)
+        r2_img = brain_masker.inverse_transform(r2)
+        r2_path = os.path.join(out_run_dir, f"{run_name}_confound_r2.nii.gz")
+        nib.save(r2_img, r2_path)
+        print(f"    [DEBUG] Confound R² map saved → {os.path.basename(r2_path)}")
+
+        # Save confound-regressed volume (no bandpass) for visual QC
+        from nilearn.image import clean_img as _clean_img, index_img
+        keep_idx_dbg = np.where(sample_mask[:T_c])[0]
+        bold_scrubbed_dbg = index_img(bold_img, keep_idx_dbg)
+        conf_scrubbed_dbg = confounds[keep_idx_dbg, :]
+        regressed_vol = _clean_img(
+            bold_scrubbed_dbg,
+            confounds=conf_scrubbed_dbg,
+            detrend=True,
+            standardize=False,
+            high_pass=None,
+            low_pass=None,
+            t_r=tr,
+        )
+        regressed_path = os.path.join(out_run_dir, f"{run_name}_confound_regressed.nii.gz")
+        nib.save(regressed_vol, regressed_path)
+        print(f"    [DEBUG] Confound-regressed volume saved → {os.path.basename(regressed_path)}")
 
     # ── Save denoised volumetric BOLD ─────────────────────────────────────────
     from nilearn.image import clean_img, index_img
