@@ -190,20 +190,24 @@ def friston_24(motion_df):
 
 # ── ACOMPCOR (from volumetric BOLD) ──────────────────────────────────────────
 
-def make_tissue_mask(seg_img, labels, bold_img):
+def make_tissue_mask(seg_img, labels, bold_img, erode=False):
     from nilearn.image import resample_to_img
+    from scipy.ndimage import binary_erosion
     import nibabel as nib
     seg_data = seg_img.get_fdata()
     mask_data = np.zeros(seg_data.shape, dtype=np.int8)
     for lbl in labels:
         mask_data[seg_data == lbl] = 1
+    if erode:
+        mask_data = binary_erosion(mask_data.astype(bool)).astype(np.int8)
     mask_img = nib.Nifti1Image(mask_data, seg_img.affine, seg_img.header)
     return resample_to_img(mask_img, bold_img, interpolation="nearest")
 
 
-def compute_acompcor(bold_img, wm_mask_img, csf_mask_img, n_components=5):
+def compute_acompcor(bold_img, wm_mask_img, csf_mask_img, n_components=5, tr=1.0):
     from nilearn.maskers import NiftiMasker
     from sklearn.decomposition import PCA
+    from scipy.signal import butter, filtfilt
     components = []
     for mask_img, name in [(wm_mask_img, "WM"), (csf_mask_img, "CSF")]:
         masker = NiftiMasker(mask_img=mask_img, standardize=True)
@@ -212,6 +216,10 @@ def compute_acompcor(bold_img, wm_mask_img, csf_mask_img, n_components=5):
         except Exception as e:
             print(f"    WARNING: aCompCor {name} failed ({e}), skipping")
             continue
+        # High-pass filter before PCA to remove slow drifts / global signal
+        nyq = 0.5 / tr
+        b, a = butter(2, HIGH_PASS / nyq, btype="high")
+        signals = filtfilt(b, a, signals, axis=0)
         n = min(n_components, signals.shape[1])
         pca = PCA(n_components=n)
         comp = pca.fit_transform(signals)
@@ -460,8 +468,8 @@ def process_run(run_name, run_dir, seg_img, schaefer_vol_atlas,
 
     # ── aCompCor from volumetric WM/CSF ──────────────────────────────────────
     print(f"    Computing aCompCor...")
-    wm_mask  = make_tissue_mask(seg_img, WM_LABELS,  bold_img)
-    csf_mask = make_tissue_mask(seg_img, CSF_LABELS, bold_img)
+    wm_mask  = make_tissue_mask(seg_img, WM_LABELS,  bold_img, erode=True)
+    csf_mask = make_tissue_mask(seg_img, CSF_LABELS, bold_img, erode=False)
 
     if args.debug:
         _dbg_dir = os.path.join(output_subj_dir, run_name)
@@ -472,7 +480,7 @@ def process_run(run_name, run_dir, seg_img, schaefer_vol_atlas,
         print(f"    [DEBUG] CSF voxels: {int(csf_mask.get_fdata().sum())}")
         print(f"    [DEBUG] Masks saved to {_dbg_dir}")
 
-    acompcor = compute_acompcor(bold_img, wm_mask, csf_mask, args.n_compcor)
+    acompcor = compute_acompcor(bold_img, wm_mask, csf_mask, args.n_compcor, tr)
 
     motion_24 = friston_24(motion_df)
     if acompcor is not None:
@@ -499,23 +507,34 @@ def process_run(run_name, run_dir, seg_img, schaefer_vol_atlas,
         confounds_df.to_csv(confounds_path, sep="\t", index=False)
         print(f"    [DEBUG] Confounds saved → {os.path.basename(confounds_path)}")
 
-        # Save R² map: variance explained by confounds at each voxel
+        # Split R² maps: motion-only vs aCompCor-only vs combined
         from nilearn.maskers import NiftiMasker
         brain_masker = NiftiMasker(mask_strategy="whole-brain-template", standardize=False)
         bold_2d = brain_masker.fit_transform(bold_img)  # [T, voxels]
         T_c = min(bold_2d.shape[0], confounds.shape[0])
         bold_2d = bold_2d[:T_c]
         conf_c  = confounds[:T_c]
-        X = np.column_stack([conf_c, np.ones(T_c)])
-        beta = np.linalg.lstsq(X, bold_2d, rcond=None)[0]
-        fitted = X @ beta
-        ss_res = ((bold_2d - fitted) ** 2).sum(axis=0)
-        ss_tot = ((bold_2d - bold_2d.mean(axis=0)) ** 2).sum(axis=0)
-        r2 = np.where(ss_tot > 0, 1 - ss_res / ss_tot, 0).astype(np.float32)
-        r2_img = brain_masker.inverse_transform(r2)
-        r2_path = os.path.join(out_run_dir, f"{run_name}_confound_r2.nii.gz")
-        nib.save(r2_img, r2_path)
-        print(f"    [DEBUG] Confound R² map saved → {os.path.basename(r2_path)}")
+        n_motion = motion_24.shape[1]
+
+        def _r2_map(regressors, y):
+            X = np.column_stack([regressors, np.ones(len(regressors))])
+            beta = np.linalg.lstsq(X, y, rcond=None)[0]
+            ss_res = ((y - X @ beta) ** 2).sum(axis=0)
+            ss_tot = ((y - y.mean(axis=0)) ** 2).sum(axis=0)
+            return np.where(ss_tot > 0, 1 - ss_res / ss_tot, 0).astype(np.float32)
+
+        r2_combined  = _r2_map(conf_c, bold_2d)
+        r2_motion    = _r2_map(conf_c[:, :n_motion], bold_2d)
+        r2_acompcor  = (_r2_map(conf_c[:, n_motion:], bold_2d)
+                        if acompcor is not None else np.zeros_like(r2_combined))
+
+        for r2, tag in [(r2_combined, "r2_combined"),
+                        (r2_motion,   "r2_motion"),
+                        (r2_acompcor, "r2_acompcor")]:
+            img  = brain_masker.inverse_transform(r2)
+            path = os.path.join(out_run_dir, f"{run_name}_confound_{tag}.nii.gz")
+            nib.save(img, path)
+            print(f"    [DEBUG] {tag} map saved → {os.path.basename(path)}")
 
         # Save confound-regressed volume (no bandpass) for visual QC
         from nilearn.image import clean_img as _clean_img, index_img
