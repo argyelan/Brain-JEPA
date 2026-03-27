@@ -96,6 +96,12 @@ def parse_args():
     p.add_argument("--fd_threshold", type=float, default=FD_THRESHOLD)
     p.add_argument("--n_compcor", type=int, default=N_COMPCOR)
     p.add_argument("--min_volumes", type=int, default=MIN_VOLUMES)
+    p.add_argument("--n_motion_params", type=int, default=12, choices=[12, 24],
+                   help="Motion regressors: 12 (6+derivatives) or 24 (adds squares)")
+    p.add_argument("--csf_acompcor", action="store_true",
+                   help="Include CSF in aCompCor (default: WM only)")
+    p.add_argument("--hcpdata", action="store_true",
+                   help="HCP non-BIDS dataset: only process REST1 LR runs (rfMRI_REST1_LR)")
     p.add_argument("--debug", action="store_true",
                    help="Save WM/CSF masks as NIfTI for visual QC")
     return p.parse_args()
@@ -115,15 +121,19 @@ def find_cifti_file(run_dir, run_name):
     return cifti_file if os.path.exists(cifti_file) else None
 
 
-def find_runs(mni_results_dir):
-    """Return list of (run_name, run_dir) for all runs in Results/."""
+def find_runs(mni_results_dir, hcpdata=False):
+    """Return list of (run_name, run_dir) for runs in Results/.
+    If hcpdata=True, only return REST1 LR runs (rfMRI_REST1_LR)."""
     runs = []
     for entry in sorted(os.listdir(mni_results_dir)):
         run_dir = os.path.join(mni_results_dir, entry)
         if not os.path.isdir(run_dir):
             continue
-        if os.path.exists(os.path.join(run_dir, "Movement_Regressors.txt")):
-            runs.append((entry, run_dir))
+        if not os.path.exists(os.path.join(run_dir, "Movement_Regressors.txt")):
+            continue
+        if hcpdata and not ("REST1" in entry and "LR" in entry):
+            continue
+        runs.append((entry, run_dir))
     return runs
 
 
@@ -176,16 +186,17 @@ def compute_fd(motion_df, head_radius=HEAD_RADIUS):
     return diff.sum(axis=1).values
 
 
-def friston_24(motion_df):
-    """24-parameter Friston model: 6 params + derivatives + squares of both."""
+def motion_params(motion_df, n_params=12):
+    """Motion regressors: 12 (6+derivatives) or 24 (adds squares of both)."""
     base_cols  = ["trans_x", "trans_y", "trans_z", "rot_x", "rot_y", "rot_z"]
     deriv_cols = [f"{c}_derivative1" for c in base_cols]
     df = motion_df[base_cols + deriv_cols].copy()
-    for col in base_cols:
-        df[f"{col}_power2"] = df[col] ** 2
-    for col in deriv_cols:
-        df[f"{col}_power2"] = df[col] ** 2
-    return df.values  # [T, 24]
+    if n_params == 24:
+        for col in base_cols + deriv_cols:
+            df[f"{col}_power2"] = df[col] ** 2
+    elif n_params != 12:
+        raise ValueError(f"n_motion_params must be 12 or 24, got {n_params}")
+    return df.values  # [T, n_params]
 
 
 # ── ACOMPCOR (from volumetric BOLD) ──────────────────────────────────────────
@@ -204,50 +215,56 @@ def make_tissue_mask(seg_img, labels, bold_img, erode=False):
     return resample_to_img(mask_img, bold_img, interpolation="nearest")
 
 
-def compute_acompcor(bold_img, wm_mask_img, csf_mask_img, n_components=5, tr=1.0):
-    from nilearn.maskers import NiftiMasker
+def compute_acompcor(wm_signals, csf_signals=None, n_components=5, tr=0.72):
+    """
+    Run PCA on pre-scrubbed, pre-detrended tissue signals.
+
+    Signals are high-pass filtered above the BOLD band (>LOW_PASS Hz) before
+    PCA so that only high-frequency physiological noise (respiratory, cardiac)
+    drives the components — not low-frequency neural-like fluctuations that
+    are shared with cortex.
+
+    wm_signals:  [T_kept, voxels]
+    csf_signals: [T_kept, voxels] or None
+    Returns:     [T_kept, n_components * n_tissues]
+    """
     from sklearn.decomposition import PCA
     from scipy.signal import butter, filtfilt
+
+    # High-pass at LOW_PASS (0.1 Hz) — keep only frequencies ABOVE the BOLD band
+    nyq = 0.5 / tr
+    b, a = butter(2, LOW_PASS / nyq, btype="high")
+
     components = []
-    for mask_img, name in [(wm_mask_img, "WM"), (csf_mask_img, "CSF")]:
-        masker = NiftiMasker(mask_img=mask_img, standardize=True)
-        try:
-            signals = masker.fit_transform(bold_img)  # [T, voxels]
-        except Exception as e:
-            print(f"    WARNING: aCompCor {name} failed ({e}), skipping")
+    tissue_signals = [("WM", wm_signals)]
+    if csf_signals is not None:
+        tissue_signals.append(("CSF", csf_signals))
+    for name, signals in tissue_signals:
+        if signals.shape[1] == 0:
+            print(f"    WARNING: aCompCor {name} mask is empty, skipping")
             continue
-        # High-pass filter before PCA to remove slow drifts / global signal
-        nyq = 0.5 / tr
-        b, a = butter(2, HIGH_PASS / nyq, btype="high")
-        signals = filtfilt(b, a, signals, axis=0)
-        n = min(n_components, signals.shape[1])
+        signals_filt = filtfilt(b, a, signals, axis=0)
+        n = min(n_components, signals_filt.shape[1])
         pca = PCA(n_components=n)
-        comp = pca.fit_transform(signals)
+        comp = pca.fit_transform(signals_filt)
         print(f"    aCompCor {name}: {n} components, "
               f"{pca.explained_variance_ratio_.sum()*100:.1f}% variance")
         components.append(comp)
-    return np.hstack(components) if components else None  # [T, 2*n_components]
+    return np.hstack(components) if components else None
 
 
 # ── SIGNAL CLEANING (works on any [T, features] array) ───────────────────────
 
-def clean_signal(data, confounds, sample_mask, tr, high_pass, low_pass):
+def clean_signal(data, confounds, tr, high_pass, low_pass):
     """
     Detrend → regress confounds → bandpass filter.
-    data:        [T, features]   float
-    confounds:   [T, C]
-    sample_mask: bool [T]  True=keep
-    Returns:     [T_kept, features]
+    data:      [T_kept, features]  float  (already scrubbed)
+    confounds: [T_kept, C]                (already scrubbed, aligned with data)
+    Returns:   [T_kept, features]
     """
     from scipy.signal import butter, filtfilt, detrend as sp_detrend
 
     data = data.astype(np.float64)
-
-    # Apply scrubbing mask
-    if sample_mask is not None:
-        data      = data[sample_mask, :]
-        confounds = confounds[sample_mask, :]
-
     T = data.shape[0]
 
     # Detrend
@@ -466,8 +483,17 @@ def process_run(run_name, run_dir, seg_img, schaefer_vol_atlas,
         print(f"    SKIP: only {n_kept} volumes survive scrubbing (min={args.min_volumes})")
         return None
 
-    # ── aCompCor from volumetric WM/CSF ──────────────────────────────────────
-    print(f"    Computing aCompCor...")
+    # ── Scrub motion params ───────────────────────────────────────────────────
+    from nilearn.image import index_img
+    from nilearn.maskers import NiftiMasker
+    from scipy.signal import detrend as sp_detrend
+
+    keep_idx       = np.where(sample_mask)[0]
+    bold_scrubbed  = index_img(bold_img, keep_idx)
+    motion_regs    = motion_params(motion_df, args.n_motion_params)
+    motion_scrubbed = motion_regs[keep_idx, :]
+
+    # ── Tissue masks ──────────────────────────────────────────────────────────
     wm_mask  = make_tissue_mask(seg_img, WM_LABELS,  bold_img, erode=True)
     csf_mask = make_tissue_mask(seg_img, CSF_LABELS, bold_img, erode=False)
 
@@ -480,15 +506,28 @@ def process_run(run_name, run_dir, seg_img, schaefer_vol_atlas,
         print(f"    [DEBUG] CSF voxels: {int(csf_mask.get_fdata().sum())}")
         print(f"    [DEBUG] Masks saved to {_dbg_dir}")
 
-    acompcor = compute_acompcor(bold_img, wm_mask, csf_mask, args.n_compcor, tr)
+    # ── aCompCor: extract signals → scrub → detrend → PCA ────────────────────
+    print(f"    Computing aCompCor...")
+    wm_masker  = NiftiMasker(mask_img=wm_mask,  standardize=False)
+    wm_signals = wm_masker.fit_transform(bold_img)        # [T, voxels]
+    wm_signals = sp_detrend(wm_signals[keep_idx, :], axis=0)  # scrub + detrend
 
-    motion_24 = friston_24(motion_df)
+    csf_signals = None
+    if args.csf_acompcor:
+        csf_masker  = NiftiMasker(mask_img=csf_mask, standardize=False)
+        csf_signals = csf_masker.fit_transform(bold_img)
+        csf_signals = sp_detrend(csf_signals[keep_idx, :], axis=0)
+
+    acompcor = compute_acompcor(wm_signals, csf_signals, args.n_compcor, tr)
+
+    # ── Build confound matrix [T_kept, C] — fully aligned with scrubbed data ─
     if acompcor is not None:
-        min_len   = min(motion_24.shape[0], acompcor.shape[0])
-        confounds = np.hstack([motion_24[:min_len], acompcor[:min_len]])
+        confounds_scrubbed = np.hstack([motion_scrubbed, acompcor])
     else:
-        confounds = motion_24
-    print(f"    Confounds: {confounds.shape[1]} regressors")
+        confounds_scrubbed = motion_scrubbed
+    n_acompcor = confounds_scrubbed.shape[1] - args.n_motion_params
+    print(f"    Confounds: {confounds_scrubbed.shape[1]} regressors "
+          f"({args.n_motion_params} motion + {n_acompcor} aCompCor)")
 
     # ── Output directory ──────────────────────────────────────────────────────
     out_run_dir = os.path.join(output_subj_dir, run_name)
@@ -496,25 +535,21 @@ def process_run(run_name, run_dir, seg_img, schaefer_vol_atlas,
 
     if args.debug:
         # Save full confounds matrix (before scrubbing) as TSV
-        motion_cols = [f"motion_{i}" for i in range(motion_24.shape[1])]
+        motion_cols = [f"motion_{i}" for i in range(motion_regs.shape[1])]
         acompcor_cols = ([f"aCompCor_{i}" for i in range(acompcor.shape[1])]
                          if acompcor is not None else [])
         col_names = motion_cols + acompcor_cols
-        confounds_df = pd.DataFrame(confounds, columns=col_names)
-        confounds_df.insert(0, "volume", np.arange(len(confounds_df)))
-        confounds_df.insert(1, "censored", (~sample_mask[:len(confounds_df)]).astype(int))
+        confounds_df = pd.DataFrame(confounds_scrubbed, columns=col_names)
+        confounds_df.insert(0, "volume", keep_idx)
         confounds_path = os.path.join(out_run_dir, f"{run_name}_confounds.tsv")
         confounds_df.to_csv(confounds_path, sep="\t", index=False)
         print(f"    [DEBUG] Confounds saved → {os.path.basename(confounds_path)}")
 
-        # Split R² maps: motion-only vs aCompCor-only vs combined
-        from nilearn.maskers import NiftiMasker
+        # Split R² maps on scrubbed data
         brain_masker = NiftiMasker(mask_strategy="whole-brain-template", standardize=False)
-        bold_2d = brain_masker.fit_transform(bold_img)  # [T, voxels]
-        T_c = min(bold_2d.shape[0], confounds.shape[0])
-        bold_2d = bold_2d[:T_c]
-        conf_c  = confounds[:T_c]
-        n_motion = motion_24.shape[1]
+        bold_2d = brain_masker.fit_transform(bold_scrubbed)  # [T_kept, voxels]
+        bold_2d = sp_detrend(bold_2d, axis=0)
+        n_motion = args.n_motion_params
 
         def _r2_map(regressors, y):
             X = np.column_stack([regressors, np.ones(len(regressors))])
@@ -523,10 +558,10 @@ def process_run(run_name, run_dir, seg_img, schaefer_vol_atlas,
             ss_tot = ((y - y.mean(axis=0)) ** 2).sum(axis=0)
             return np.where(ss_tot > 0, 1 - ss_res / ss_tot, 0).astype(np.float32)
 
-        r2_combined  = _r2_map(conf_c, bold_2d)
-        r2_motion    = _r2_map(conf_c[:, :n_motion], bold_2d)
-        r2_acompcor  = (_r2_map(conf_c[:, n_motion:], bold_2d)
-                        if acompcor is not None else np.zeros_like(r2_combined))
+        r2_combined = _r2_map(confounds_scrubbed, bold_2d)
+        r2_motion   = _r2_map(confounds_scrubbed[:, :n_motion], bold_2d)
+        r2_acompcor = (_r2_map(confounds_scrubbed[:, n_motion:], bold_2d)
+                       if acompcor is not None else np.zeros_like(r2_combined))
 
         for r2, tag in [(r2_combined, "r2_combined"),
                         (r2_motion,   "r2_motion"),
@@ -537,13 +572,10 @@ def process_run(run_name, run_dir, seg_img, schaefer_vol_atlas,
             print(f"    [DEBUG] {tag} map saved → {os.path.basename(path)}")
 
         # Save confound-regressed volume (no bandpass) for visual QC
-        from nilearn.image import clean_img as _clean_img, index_img
-        keep_idx_dbg = np.where(sample_mask[:T_c])[0]
-        bold_scrubbed_dbg = index_img(bold_img, keep_idx_dbg)
-        conf_scrubbed_dbg = confounds[keep_idx_dbg, :]
+        from nilearn.image import clean_img as _clean_img
         regressed_vol = _clean_img(
-            bold_scrubbed_dbg,
-            confounds=conf_scrubbed_dbg,
+            bold_scrubbed,
+            confounds=confounds_scrubbed,
             detrend=True,
             standardize=False,
             high_pass=None,
@@ -554,11 +586,17 @@ def process_run(run_name, run_dir, seg_img, schaefer_vol_atlas,
         nib.save(regressed_vol, regressed_path)
         print(f"    [DEBUG] Confound-regressed volume saved → {os.path.basename(regressed_path)}")
 
+    # ── Save temporal mean of scrubbed BOLD (before denoising) ───────────────
+    import nibabel as nib2
+    bold_scrubbed_data = bold_scrubbed.get_fdata(dtype=np.float32)
+    vol_mean = bold_scrubbed_data.mean(axis=-1)
+    vol_mean_img = nib2.Nifti1Image(vol_mean, bold_scrubbed.affine, bold_scrubbed.header)
+    vol_mean_path = os.path.join(out_run_dir, f"{run_name}_mean.nii.gz")
+    nib.save(vol_mean_img, vol_mean_path)
+    print(f"    [VOL] Saved temporal mean → {os.path.basename(vol_mean_path)}")
+
     # ── Save denoised volumetric BOLD ─────────────────────────────────────────
-    from nilearn.image import clean_img, index_img
-    keep_idx = np.where(sample_mask)[0]
-    bold_scrubbed = index_img(bold_img, keep_idx)
-    confounds_scrubbed = confounds[keep_idx, :]
+    from nilearn.image import clean_img
     clean_vol = clean_img(
         bold_scrubbed,
         confounds=confounds_scrubbed,
@@ -572,26 +610,44 @@ def process_run(run_name, run_dir, seg_img, schaefer_vol_atlas,
     nib.save(clean_vol, clean_vol_path)
     print(f"    [VOL] Saved denoised volumetric → {os.path.basename(clean_vol_path)}")
 
+    # Save denoised + mean restored
+    clean_data_vol = clean_vol.get_fdata(dtype=np.float32) + vol_mean[..., np.newaxis]
+    clean_mean_vol_img = nib.Nifti1Image(clean_data_vol, clean_vol.affine, clean_vol.header)
+    clean_mean_vol_path = os.path.join(out_run_dir, f"{run_name}_denoised_meanadded.nii.gz")
+    nib.save(clean_mean_vol_img, clean_mean_vol_path)
+    print(f"    [VOL] Saved denoised+mean volumetric → {os.path.basename(clean_mean_vol_path)}")
+
     # ── CIFTI track (primary if available + dlabel provided) ──────────────────
     if use_cifti:
         print(f"    [CIFTI] Loading {os.path.basename(cifti_file)}...")
         cifti_img, cifti_data, bm_ax = load_cifti(cifti_file)
 
-        # Trim CIFTI to same length as motion if needed
-        if cifti_data.shape[0] != len(confounds):
-            min_len    = min(cifti_data.shape[0], len(confounds))
-            cifti_data = cifti_data[:min_len, :]
-            confounds  = confounds[:min_len, :]
-            sample_mask = sample_mask[:min_len]
+        # Scrub CIFTI and trim to match confounds length
+        min_len    = min(cifti_data.shape[0], len(sample_mask))
+        cifti_data = cifti_data[:min_len, :]
+        cifti_data = cifti_data[keep_idx[keep_idx < min_len], :]
+
+        # Save temporal mean of scrubbed CIFTI (before denoising)
+        cifti_mean = cifti_data.mean(axis=0)   # [G]
+        cifti_mean_path = os.path.join(out_run_dir, f"{run_name}_Atlas_mean.npy")
+        np.save(cifti_mean_path, cifti_mean)
+        print(f"    [CIFTI] Saved temporal mean → {os.path.basename(cifti_mean_path)}")
 
         print(f"    [CIFTI] Cleaning signal ({cifti_data.shape[1]} grayordinates)...")
-        clean_data = clean_signal(cifti_data, confounds, sample_mask,
+        conf_cifti = confounds_scrubbed[:cifti_data.shape[0], :]
+        clean_data = clean_signal(cifti_data, conf_cifti,
                                   tr, HIGH_PASS, LOW_PASS)   # [T_kept, G]
 
         # Save denoised CIFTI
         clean_cifti_path = os.path.join(out_run_dir, f"{run_name}_Atlas_denoised.dtseries.nii")
         save_cifti(clean_data, cifti_img, clean_cifti_path)
         print(f"    [CIFTI] Saved denoised CIFTI → {os.path.basename(clean_cifti_path)}")
+
+        # Save denoised + mean restored
+        clean_data_meanadded = clean_data + cifti_mean[np.newaxis, :]
+        clean_cifti_mean_path = os.path.join(out_run_dir, f"{run_name}_Atlas_denoised_meanadded.dtseries.nii")
+        save_cifti(clean_data_meanadded, cifti_img, clean_cifti_mean_path)
+        print(f"    [CIFTI] Saved denoised+mean CIFTI → {os.path.basename(clean_cifti_mean_path)}")
 
         # Parcellate → Brain-JEPA format
         print(f"    [CIFTI] Parcellating (Schaefer {SCHAEFER_N_ROIS} + Tian S3)...")
@@ -605,15 +661,15 @@ def process_run(run_name, run_dir, seg_img, schaefer_vol_atlas,
         print(f"    [VOL] Parcellating (Schaefer {SCHAEFER_N_ROIS})...")
         schaefer_img, schaefer_labels = schaefer_vol_atlas
         ts_cortical = parcellate_volumetric(
-            bold_img, schaefer_img, schaefer_labels, confounds, tr,
-            HIGH_PASS, LOW_PASS, sample_mask)
+            bold_scrubbed, schaefer_img, schaefer_labels, confounds_scrubbed, tr,
+            HIGH_PASS, LOW_PASS, sample_mask=None)
 
         print(f"    [VOL] Parcellating (Tian S3)...")
         tian_n = int(tian_img.get_fdata().max())
         tian_labels = [f"subcortical_{i}" for i in range(1, tian_n + 1)]
         ts_subcortical = parcellate_volumetric(
-            bold_img, tian_img, tian_labels, confounds, tr,
-            HIGH_PASS, LOW_PASS, sample_mask)
+            bold_scrubbed, tian_img, tian_labels, confounds_scrubbed, tr,
+            HIGH_PASS, LOW_PASS, sample_mask=None)
 
         save_brain_jepa_format(ts_cortical, ts_subcortical, out_run_dir)
         print(f"    [VOL] Brain-JEPA CSVs saved → {out_run_dir}")
@@ -651,7 +707,7 @@ def process_subject(subject_dir, schaefer_vol_atlas, tian_img,
     output_subj_dir = os.path.join(args.output_dir, "time_series", subj_name)
     os.makedirs(output_subj_dir, exist_ok=True)
 
-    runs = find_runs(results_dir)
+    runs = find_runs(results_dir, hcpdata=args.hcpdata)
     print(f"  Found {len(runs)} runs: {[r[0] for r in runs]}")
 
     qc_records = []
