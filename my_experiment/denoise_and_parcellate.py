@@ -121,6 +121,18 @@ def find_cifti_file(run_dir, run_name):
     return cifti_file if os.path.exists(cifti_file) else None
 
 
+def find_hp2000_clean_cifti(run_dir, run_name):
+    """ICA-FIX cleaned CIFTI: bold_Atlas_hp2000_clean.dtseries.nii."""
+    f = os.path.join(run_dir, f"{run_name}_Atlas_hp2000_clean.dtseries.nii")
+    return f if os.path.exists(f) else None
+
+
+def find_hp2000_clean_vol(run_dir, run_name):
+    """ICA-FIX cleaned volumetric: bold_hp2000_clean.nii.gz."""
+    f = os.path.join(run_dir, f"{run_name}_hp2000_clean.nii.gz")
+    return f if os.path.exists(f) else None
+
+
 def find_runs(mni_results_dir, hcpdata=False):
     """Return list of (run_name, run_dir) for runs in Results/.
     If hcpdata=True, only return REST1 LR runs (rfMRI_REST1_LR)."""
@@ -437,6 +449,14 @@ def save_brain_jepa_format(ts_cortical, ts_subcortical, out_dir):
     df_sub.to_csv(os.path.join(out_dir, SUBCORTICAL_FILE), index=False, compression="gzip")
 
 
+def save_corrmat(ts_cortical, ts_subcortical, out_dir, tag):
+    """Compute and save ROI x ROI correlation matrix (cortical + subcortical)."""
+    ts = np.vstack([ts_cortical, ts_subcortical])   # [450, T]
+    corrmat = np.corrcoef(ts).astype(np.float32)    # [450, 450]
+    np.save(os.path.join(out_dir, f"corrmat_{tag}.npy"), corrmat)
+    print(f"    [CORRMAT] Saved {tag} ({corrmat.shape[0]} ROIs) → corrmat_{tag}.npy")
+
+
 # ── RUN PROCESSING ────────────────────────────────────────────────────────────
 
 def process_run(run_name, run_dir, seg_img, schaefer_vol_atlas,
@@ -655,6 +675,37 @@ def process_run(run_name, run_dir, seg_img, schaefer_vol_atlas,
             clean_data, bm_ax, schaefer_dlabel_img, tian_img)
         save_brain_jepa_format(ts_cortical, ts_subcortical, out_run_dir)
         print(f"    [CIFTI] Brain-JEPA CSVs saved → {out_run_dir}")
+
+        # ── Correlation matrices ───────────────────────────────────────────────
+        print(f"    [CORRMAT] Computing correlation matrices...")
+
+        # 1. Raw (original, no denoising) — scrubbed only
+        ts_ctx_raw, ts_sub_raw = parcellate_cifti(
+            cifti_data, bm_ax, schaefer_dlabel_img, tian_img)
+        save_corrmat(ts_ctx_raw, ts_sub_raw, out_run_dir, "raw")
+
+        # 2. Denoised + mean added
+        ts_ctx_mean, ts_sub_mean = parcellate_cifti(
+            clean_data_meanadded, bm_ax, schaefer_dlabel_img, tian_img)
+        save_corrmat(ts_ctx_mean, ts_sub_mean, out_run_dir, "denoised_meanadded")
+
+        # 3. ICA-FIX hp2000_clean CIFTI (if available)
+        hp_cifti_file = find_hp2000_clean_cifti(run_dir, run_name)
+        hp_vol_file   = find_hp2000_clean_vol(run_dir, run_name)
+        if hp_cifti_file:
+            print(f"    [CORRMAT] Loading hp2000_clean CIFTI...")
+            _, hp_cifti_data, hp_bm_ax = load_cifti(hp_cifti_file)
+            hp_cifti_data = hp_cifti_data[keep_idx[keep_idx < hp_cifti_data.shape[0]], :]
+            ts_ctx_hp, ts_sub_hp = parcellate_cifti(
+                hp_cifti_data, hp_bm_ax, schaefer_dlabel_img, tian_img)
+            save_corrmat(ts_ctx_hp, ts_sub_hp, out_run_dir, "hp2000_clean")
+        else:
+            print(f"    [CORRMAT] hp2000_clean CIFTI not found, skipping")
+
+        if hp_vol_file:
+            print(f"    [CORRMAT] hp2000_clean volumetric found → {os.path.basename(hp_vol_file)}")
+        else:
+            print(f"    [CORRMAT] hp2000_clean volumetric not found")
 
     # ── Volumetric track (fallback or when CIFTI not available) ───────────────
     else:
