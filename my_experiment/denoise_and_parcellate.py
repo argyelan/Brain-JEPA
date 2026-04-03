@@ -102,6 +102,8 @@ def parse_args():
                    help="Include CSF in aCompCor (default: WM only)")
     p.add_argument("--hcpdata", action="store_true",
                    help="HCP non-BIDS dataset: only process REST1 LR runs (rfMRI_REST1_LR)")
+    p.add_argument("--run", default=None,
+                   help="Process only this run name (e.g. ses-23117_task-rest_acq-PA_run-01_bold)")
     p.add_argument("--debug", action="store_true",
                    help="Save WM/CSF masks as NIfTI for visual QC")
     return p.parse_args()
@@ -759,6 +761,8 @@ def process_subject(subject_dir, schaefer_vol_atlas, tian_img,
     os.makedirs(output_subj_dir, exist_ok=True)
 
     runs = find_runs(results_dir, hcpdata=args.hcpdata)
+    if args.run:
+        runs = [(n, d) for n, d in runs if n == args.run]
     print(f"  Found {len(runs)} runs: {[r[0] for r in runs]}")
 
     qc_records = []
